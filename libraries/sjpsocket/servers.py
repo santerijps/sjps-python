@@ -1,15 +1,87 @@
 from sjpsocket.core import (
     build_http_response, build_regex_url, get_mime_type, get_parent_dir,
-    is_file_url, parse_http_request, request_loop
+    http_client_request_loop, is_file_url, parse_http_request
 )
 
+from sjpsunits import Size
+
+from asyncio import run, start_server, TimeoutError, wait_for
 from http import HTTPStatus
 from inspect import signature, _empty
 from json import dumps
 from os import listdir
 from os.path import exists, join
+from socket import AF_INET, SO_REUSEADDR
 from types import FunctionType
 from urllib.parse import unquote_plus
+
+
+class AsyncHttpServer:
+
+    def __init__(self, host: str = 'localhost', port: int = 8080, request_handler: FunctionType = None,
+                 request_max_size: int = 500 * Size.megabyte, request_buffer_size: int = 4 * Size.kilobyte,
+                 request_timeout: float = 0.5):
+        
+        self.host = host
+        self.port = port
+
+        self.request_handler = request_handler or (lambda: build_http_response(404, {}, ''))
+        self.request_max_size = request_max_size
+        self.request_buffer_size = request_buffer_size
+        self.request_timeout = request_timeout
+        
+
+    async def read_all(self, reader) -> bytes:
+
+        # TODO: Use selectors to read from the client socket instead! (to avoid timeout)
+
+        result: bytes = bytes()
+        
+        try:
+
+            while True:
+
+                data = await wait_for(reader.read(self.request_buffer_size), self.request_timeout)
+
+                if len(result) + len(data) <= self.request_max_size:
+                    result += data
+                else:
+                    # Return None to avoid processing the request
+                    return None
+
+        except TimeoutError:
+            pass
+
+        return result
+
+
+    async def handle_client(self, reader, writer):
+
+        if (data := await self.read_all(reader)):
+            request = parse_http_request(data)
+            response = self.request_handler(request)
+            writer.write(response)
+            await writer.drain()
+
+        writer.close()
+
+
+    async def server_loop(self):
+
+        server = await start_server(
+            self.handle_client, self.host, self.port, family=AF_INET,
+            reuse_address=SO_REUSEADDR
+        )
+
+        async with server:
+            await server.serve_forever()
+
+
+    def start(self):
+        try:
+            run(self.server_loop())
+        except KeyboardInterrupt:
+            pass
 
 
 def file_server(root_directory: str, port: int = 8080):
@@ -17,11 +89,9 @@ def file_server(root_directory: str, port: int = 8080):
 
     assert exists(root_directory)
 
-    for client, data in request_loop(port=port):
+    for client, request in http_client_request_loop(port=port):
 
-        request = parse_http_request(data)
         headers = {'Connection': 'close'}
-
         path = join(root_directory, request['path'][1:])
 
         if exists(path):
@@ -81,9 +151,8 @@ def single_page_application_server(root_directory: str, port: int = 8080, urls: 
     assert exists(root_directory)
     assert exists(root_file)
 
-    for client, data in request_loop(port=port):
+    for client, data in http_client_request_loop(port=port):
 
-        request = parse_http_request(data)
         headers = {'Connection': 'close'}
         status = HTTPStatus.OK
 
@@ -123,13 +192,7 @@ def web_server(port: int, root_directory: str, urls: dict, static_directory: str
 
     file_uploads = {} # client socket FD => boundary
 
-    for client, data in request_loop(port=port):
-
-        if client.fileno() in file_uploads:
-            # TODO: Parse HTTP file upload
-            print(data)
-
-        request = parse_http_request(data)
+    for client, request in http_client_request_loop(port=port):
 
         status = HTTPStatus.NOT_FOUND
         headers = {'Connection': 'close'}
@@ -254,13 +317,6 @@ def web_server(port: int, root_directory: str, urls: dict, static_directory: str
 
         headers['Content-Length'] = len(body)
         response = build_http_response(status, headers, body)
-
         client.send(response)
-        
-        if 'content-type' in request:
-            boundary = request['content-type'].split(';', 1)[1].split('boundary=', 1)[1]
-            file_uploads[client.fileno()] = boundary
-        else:
-            client.close()
 
         print(int(status), request['method'], request['path'])
